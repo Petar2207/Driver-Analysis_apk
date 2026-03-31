@@ -6,3 +6,4 @@ matplotlib
 shap
 openpyxl
 xlrd
+python-pptx
