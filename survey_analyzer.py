@@ -3,16 +3,22 @@ import sys
 import traceback
 from dataclasses import dataclass
 from typing import Optional
+from pathlib import Path
+import contextlib
+import io
 
 import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
 
 from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.util import Pt
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -28,6 +34,11 @@ from PySide6.QtWidgets import (
     QComboBox,
     QVBoxLayout,
     QWidget,
+    QSpinBox,
+    QDialog,
+    QListWidget,
+    QListWidgetItem,
+    QDialogButtonBox,
 )
 
 import matplotlib
@@ -217,10 +228,6 @@ def process(df: pd.DataFrame, target_col):
     return X_train, X_test, Y_train, Y_test
 
 
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import accuracy_score
-
-
 def classifier(X_train, Y_train, X_test, Y_test):
     rf = RandomForestClassifier(random_state=42)
 
@@ -373,6 +380,187 @@ def _replace_placeholders_in_shape(shape, replacements):
     _replace_text_in_table(shape, replacements)
 
 
+def _shape_contains_placeholder(shape, placeholder: str) -> bool:
+    try:
+        if hasattr(shape, "text_frame") and shape.text_frame is not None:
+            if placeholder in shape.text:
+                return True
+    except Exception:
+        pass
+
+    try:
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    if placeholder in cell.text:
+                        return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _apply_red_outline(shape):
+    try:
+        if hasattr(shape, "line") and shape.line is not None:
+            shape.line.color.rgb = RGBColor(255, 0, 0)
+            shape.line.width = Pt(2.5)
+    except Exception:
+        pass
+
+
+def _style_negative_placeholder_shapes(shape, negative_placeholders):
+    if shape.shape_type == 6 and hasattr(shape, "shapes"):
+        for subshape in shape.shapes:
+            _style_negative_placeholder_shapes(subshape, negative_placeholders)
+        return
+
+    for placeholder in negative_placeholders:
+        if _shape_contains_placeholder(shape, placeholder):
+            _apply_red_outline(shape)
+            break
+
+
+def _safe_shape_text(shape) -> str:
+    try:
+        if hasattr(shape, "text_frame") and shape.text_frame is not None:
+            return shape.text or ""
+    except Exception:
+        pass
+    return ""
+
+
+def _group_contains_text(group_shape, needle: str) -> bool:
+    needle_lower = needle.lower()
+    for subshape in group_shape.shapes:
+        if subshape.shape_type == 6 and hasattr(subshape, "shapes"):
+            if _group_contains_text(subshape, needle):
+                return True
+        else:
+            txt = _safe_shape_text(subshape)
+            if needle_lower in txt.lower():
+                return True
+    return False
+
+
+def _remove_shape(shape):
+    try:
+        sp = shape._element
+        parent = sp.getparent()
+        if parent is not None:
+            parent.remove(sp)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_small_red_outline_box(shape) -> bool:
+    try:
+        txt = _safe_shape_text(shape).strip()
+        if txt:
+            return False
+    except Exception:
+        return False
+
+    try:
+        if not hasattr(shape, "line") or shape.line is None:
+            return False
+
+        rgb = shape.line.color.rgb
+        if rgb is None:
+            return False
+
+        if tuple(rgb) != (255, 0, 0):
+            return False
+
+        # small legend box heuristic
+        width = int(shape.width)
+        height = int(shape.height)
+
+        # in EMU; roughly <= 3 cm wide and <= 1.5 cm high
+        if width <= 1100000 and height <= 600000:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _remove_negative_legend(slide):
+    """
+    Removes the 'Negativ koreliert' legend when no negative items were selected.
+    Works best if the legend is grouped in PowerPoint.
+    If not grouped, it removes the text shape and also tries to remove a nearby small red outline box.
+    """
+    legend_text = "Negativ koreliert"
+    removed_any = False
+
+    # 1) First try to remove a whole group that contains the legend text
+    for shape in list(slide.shapes):
+        try:
+            if shape.shape_type == 6 and hasattr(shape, "shapes"):
+                if _group_contains_text(shape, legend_text):
+                    if _remove_shape(shape):
+                        removed_any = True
+        except Exception:
+            pass
+
+    if removed_any:
+        return
+
+    # 2) If not grouped, find the text shape
+    legend_shape = None
+    for shape in list(slide.shapes):
+        try:
+            txt = _safe_shape_text(shape)
+            if legend_text.lower() in txt.lower():
+                legend_shape = shape
+                break
+        except Exception:
+            pass
+
+    if legend_shape is None:
+        return
+
+    legend_left = int(legend_shape.left)
+    legend_top = int(legend_shape.top)
+    legend_height = int(legend_shape.height)
+
+    # 3) Find a likely matching red outlined box to the left of the text
+    shapes_to_remove = [legend_shape]
+
+    for shape in list(slide.shapes):
+        if shape is legend_shape:
+            continue
+
+        try:
+            if not _is_small_red_outline_box(shape):
+                continue
+
+            shape_left = int(shape.left)
+            shape_top = int(shape.top)
+            shape_width = int(shape.width)
+            shape_height = int(shape.height)
+
+            shape_right = shape_left + shape_width
+            legend_mid_y = legend_top + legend_height / 2
+            shape_mid_y = shape_top + shape_height / 2
+
+            same_row = abs(shape_mid_y - legend_mid_y) <= max(shape_height, legend_height)
+            left_of_text = shape_right <= legend_left + 200000
+            close_to_text = abs(legend_left - shape_right) <= 800000
+
+            if same_row and left_of_text and close_to_text:
+                shapes_to_remove.append(shape)
+                break
+        except Exception:
+            pass
+
+    for shp in shapes_to_remove:
+        _remove_shape(shp)
+
+
 def fill_template_ppt(
     template_path: str,
     output_pptx: str,
@@ -384,7 +572,8 @@ def fill_template_ppt(
         "auf einer Skala von 0 bis 1, wobei 1 perfekte Genauigkeit bedeutet."
     ),
     max_items: int = 8,
-    slide_index: int = 0
+    slide_index: int = 0,
+    negative_item_positions=None
 ):
     prs = Presentation(template_path)
     slide = prs.slides[slide_index]
@@ -405,6 +594,20 @@ def fill_template_ppt(
             replacements[f"{{{{ITEM{i}}}}}"] = str(txt)
         else:
             replacements[f"{{{{ITEM{i}}}}}"] = ""
+
+    if negative_item_positions is None:
+        negative_item_positions = []
+
+    negative_placeholders = {
+        f"{{{{ITEM{i}}}}}" for i in negative_item_positions
+    }
+
+    # NEW: remove legend completely when no negative items were chosen
+    if not negative_item_positions:
+        _remove_negative_legend(slide)
+
+    for shape in slide.shapes:
+        _style_negative_placeholder_shapes(shape, negative_placeholders)
 
     for shape in slide.shapes:
         _replace_placeholders_in_shape(shape, replacements)
@@ -503,13 +706,6 @@ def shap_multiclass_report(
     return global_top, explainer, shap_values_raw
 
 
-from pathlib import Path
-import contextlib
-import io
-
-from PySide6.QtWidgets import QSpinBox
-
-
 def _normalize_qid_ui(value) -> str:
     if pd.isna(value):
         return ""
@@ -591,6 +787,166 @@ class _LogEmitter(io.StringIO):
         if self._buffer.strip():
             self.signal.emit(self._buffer.strip())
         self._buffer = ""
+
+
+class FeatureSelectionDialog(QDialog):
+    def __init__(self, global_top: pd.DataFrame, required_count: int = 8, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select items for presentation")
+        self.resize(780, 540)
+
+        self.df = global_top.reset_index(drop=True).copy()
+        self.required_count = required_count
+
+        layout = QVBoxLayout(self)
+
+        self.info_label = QLabel(
+            f"Select exactly {self.required_count} items for the PowerPoint slide."
+        )
+        self.info_label.setWordWrap(True)
+
+        self.count_label = QLabel("")
+
+        self.list_widget = QListWidget()
+
+        for idx, row in self.df.iterrows():
+            txt = row["Text"] if pd.notna(row.get("Text")) and str(row.get("Text")).strip() else row["Feature"]
+            shap_score = row.get("Mean |SHAP| (global)", None)
+
+            if pd.notna(shap_score):
+                display_text = f"{idx + 1}. {txt}    | SHAP: {float(shap_score):.4f}"
+            else:
+                display_text = f"{idx + 1}. {txt}"
+
+            item = QListWidgetItem(display_text)
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            item.setData(Qt.ItemDataRole.UserRole, idx)
+
+            if idx < self.required_count:
+                item.setCheckState(Qt.CheckState.Checked)
+            else:
+                item.setCheckState(Qt.CheckState.Unchecked)
+
+            self.list_widget.addItem(item)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setText("Create PowerPoint")
+
+        layout.addWidget(self.info_label)
+        layout.addWidget(self.count_label)
+        layout.addWidget(self.list_widget)
+        layout.addWidget(self.buttons)
+
+        self.list_widget.itemChanged.connect(self._on_item_changed)
+        self.buttons.accepted.connect(self._accept_if_valid)
+        self.buttons.rejected.connect(self.reject)
+
+        self._update_state()
+
+    def _selected_indices(self):
+        indices = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                indices.append(item.data(Qt.ItemDataRole.UserRole))
+        return indices
+
+    def _update_state(self):
+        selected = len(self._selected_indices())
+        self.count_label.setText(f"Selected: {selected} / {self.required_count}")
+        self.ok_button.setEnabled(selected == self.required_count)
+
+    def _on_item_changed(self, changed_item):
+        selected_items = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected_items.append(item)
+
+        if len(selected_items) > self.required_count:
+            self.list_widget.blockSignals(True)
+            changed_item.setCheckState(Qt.CheckState.Unchecked)
+            self.list_widget.blockSignals(False)
+            QMessageBox.warning(
+                self,
+                "Maximum reached",
+                f"You must select exactly {self.required_count} items."
+            )
+
+        self._update_state()
+
+    def _accept_if_valid(self):
+        selected = len(self._selected_indices())
+        if selected != self.required_count:
+            QMessageBox.warning(
+                self,
+                "Select exactly 8 items",
+                f"You must select exactly {self.required_count} items."
+            )
+            return
+        self.accept()
+
+    def selected_df(self) -> pd.DataFrame:
+        indices = self._selected_indices()
+        return self.df.iloc[indices].copy()
+
+
+class NegativeItemsDialog(QDialog):
+    def __init__(self, selected_df: pd.DataFrame, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mark negative items")
+        self.resize(760, 480)
+
+        self.df = selected_df.reset_index(drop=True).copy()
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Optional: tick the selected items that should get a red outline in the PowerPoint."
+        )
+        info.setWordWrap(True)
+
+        self.list_widget = QListWidget()
+
+        for idx, row in self.df.iterrows():
+            txt = row["Text"] if pd.notna(row.get("Text")) and str(row.get("Text")).strip() else row["Feature"]
+            item = QListWidgetItem(f"{idx + 1}. {txt}")
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, idx + 1)  # slide position 1..8
+            self.list_widget.addItem(item)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_btn.setText("Continue")
+
+        layout.addWidget(info)
+        layout.addWidget(self.list_widget)
+        layout.addWidget(self.buttons)
+
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+    def selected_positions(self):
+        positions = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                positions.append(item.data(Qt.ItemDataRole.UserRole))
+        return positions
 
 
 class AnalysisWorker(QObject):
@@ -702,16 +1058,13 @@ class AnalysisWorker(QObject):
                         f"Put 'impact_template.pptx' in the same folder as this Python script."
                     )
 
-                ppt_path = str(out_dir / f"impact_slide_target_{self.target_question}.pptx")
+                if len(global_top) < 8:
+                    raise ValueError(
+                        f"Only {len(global_top)} ranked items are available. "
+                        f"At least 8 are required for the presentation."
+                    )
 
-                fill_template_ppt(
-                    template_path=template_path,
-                    output_pptx=ppt_path,
-                    global_top=global_top,
-                    target_text=target_text,
-                    cv_accuracy=best_cv_score,
-                    max_items=8
-                )
+                ppt_path = str(out_dir / f"impact_slide_target_{self.target_question}.pptx")
 
                 self.progress.emit(100)
                 self.finished.emit({
@@ -724,8 +1077,11 @@ class AnalysisWorker(QObject):
                     "excel_path": output_excel,
                     "plot_path": plot_path,
                     "ppt_path": ppt_path,
+                    "template_path": template_path,
+                    "target_text": target_text,
                     "save_dir": str(out_dir),
-                    "top_preview": global_top.head(10).to_string(index=False)
+                    "top_preview": global_top.head(10).to_string(index=False),
+                    "global_top_records": global_top.to_dict(orient="records")
                 })
 
         except Exception:
@@ -751,7 +1107,7 @@ class SurveyAnalyzerWindow(QMainWindow):
         self.percent_spin.setValue(30)
         self.percent_spin.setSuffix(" %")
         self.top_n_spin = QSpinBox()
-        self.top_n_spin.setRange(1, 1000)
+        self.top_n_spin.setRange(8, 1000)
         self.top_n_spin.setValue(15)
 
         self.run_button = QPushButton("Run")
@@ -871,6 +1227,14 @@ class SurveyAnalyzerWindow(QMainWindow):
             QMessageBox.warning(self, "Missing save folder", "Please choose where results should be saved.")
             return
 
+        if top_n < 8:
+            QMessageBox.warning(
+                self,
+                "Invalid top value",
+                "Top values must be at least 8 because the presentation requires exactly 8 selected items."
+            )
+            return
+
         self.log_box.clear()
         self.result_label.setText("")
         self.progress.setValue(0)
@@ -909,12 +1273,71 @@ class SurveyAnalyzerWindow(QMainWindow):
             self.thread.deleteLater()
             self.thread = None
 
+    def _create_ppt_from_selection(self, result: dict):
+        global_top_df = pd.DataFrame(result["global_top_records"])
+
+        dialog = FeatureSelectionDialog(global_top_df, required_count=8, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText(
+                "Analysis finished. Excel and SHAP plot were saved, but PowerPoint was not created."
+            )
+            return None
+
+        selected_df = dialog.selected_df()
+
+        negative_dialog = NegativeItemsDialog(selected_df, parent=self)
+        if negative_dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText(
+                "Analysis finished. Excel and SHAP plot were saved, but PowerPoint was not created."
+            )
+            return None
+
+        negative_item_positions = negative_dialog.selected_positions()
+
+        fill_template_ppt(
+            template_path=result["template_path"],
+            output_pptx=result["ppt_path"],
+            global_top=selected_df,
+            target_text=result["target_text"],
+            cv_accuracy=result["best_cv_score"],
+            max_items=8,
+            negative_item_positions=negative_item_positions
+        )
+
+        self._append_log("")
+        self._append_log("Selected items for PowerPoint:")
+        for pos, (_, row) in enumerate(selected_df.iterrows(), start=1):
+            txt = row["Text"] if pd.notna(row.get("Text")) and str(row.get("Text")).strip() else row["Feature"]
+            negative_mark = " [RED OUTLINE]" if pos in negative_item_positions else ""
+            self._append_log(f" - {txt}{negative_mark}")
+
+        if negative_item_positions:
+            self._append_log("Negative legend shown.")
+        else:
+            self._append_log("No negative items selected -> negative legend hidden.")
+
+        return result["ppt_path"]
+
     def _on_finished(self, result: dict):
         excel_uri = Path(result["excel_path"]).resolve().as_uri()
         plot_uri = Path(result["plot_path"]).resolve().as_uri()
-        ppt_uri = Path(result["ppt_path"]).resolve().as_uri()
 
-        self.status_label.setText("Finished successfully.")
+        ppt_uri = None
+        try:
+            created_ppt_path = self._create_ppt_from_selection(result)
+            if created_ppt_path:
+                ppt_uri = Path(created_ppt_path).resolve().as_uri()
+        except Exception:
+            error_text = traceback.format_exc()
+            self.status_label.setText("Analysis finished, but PowerPoint creation failed.")
+            self._append_log(error_text)
+            QMessageBox.critical(self, "PowerPoint error", error_text)
+
+        if ppt_uri:
+            ppt_link = f"<a href='{ppt_uri}'>Open PowerPoint slide</a>"
+            self.status_label.setText("Finished successfully.")
+        else:
+            ppt_link = "PowerPoint not created."
 
         self.result_label.setText(
             f"<b>Done.</b><br>"
@@ -927,7 +1350,7 @@ class SurveyAnalyzerWindow(QMainWindow):
             f"Best params: {result['best_params']}<br><br>"
             f"<a href='{excel_uri}'>Open Excel output</a><br>"
             f"<a href='{plot_uri}'>Open SHAP plot</a><br>"
-            f"<a href='{ppt_uri}'>Open PowerPoint slide</a>"
+            f"{ppt_link}"
         )
 
         self._append_log("")
@@ -935,7 +1358,11 @@ class SurveyAnalyzerWindow(QMainWindow):
         self._append_log("Top features preview:")
         self._append_log(result["top_preview"])
 
-        QMessageBox.information(self, "Finished", f"Analysis completed.\nSaved in:\n{result['save_dir']}")
+        QMessageBox.information(
+            self,
+            "Finished",
+            f"Analysis completed.\nSaved in:\n{result['save_dir']}"
+        )
 
     def _on_failed(self, error_text: str):
         self.status_label.setText("Failed.")
