@@ -47,6 +47,22 @@ import matplotlib.pyplot as plt
 import shap
 
 
+def next_available_path(path: str | Path) -> Path:
+    path = Path(path)
+    parent = path.parent
+    stem = path.stem
+    suffix = path.suffix
+
+    candidate = path
+    counter = 1
+
+    while candidate.exists():
+        candidate = parent / f"{stem} ({counter}){suffix}"
+        counter += 1
+
+    return candidate
+
+
 def load_data(data_path, questions_path):
     df = pd.read_excel(data_path)
     df_pitanja = pd.read_excel(questions_path)
@@ -474,11 +490,9 @@ def _is_small_red_outline_box(shape) -> bool:
         if tuple(rgb) != (255, 0, 0):
             return False
 
-        # small legend box heuristic
         width = int(shape.width)
         height = int(shape.height)
 
-        # in EMU; roughly <= 3 cm wide and <= 1.5 cm high
         if width <= 1100000 and height <= 600000:
             return True
     except Exception:
@@ -496,7 +510,6 @@ def _remove_negative_legend(slide):
     legend_text = "Negativ koreliert"
     removed_any = False
 
-    # 1) First try to remove a whole group that contains the legend text
     for shape in list(slide.shapes):
         try:
             if shape.shape_type == 6 and hasattr(shape, "shapes"):
@@ -509,7 +522,6 @@ def _remove_negative_legend(slide):
     if removed_any:
         return
 
-    # 2) If not grouped, find the text shape
     legend_shape = None
     for shape in list(slide.shapes):
         try:
@@ -527,7 +539,6 @@ def _remove_negative_legend(slide):
     legend_top = int(legend_shape.top)
     legend_height = int(legend_shape.height)
 
-    # 3) Find a likely matching red outlined box to the left of the text
     shapes_to_remove = [legend_shape]
 
     for shape in list(slide.shapes):
@@ -602,7 +613,6 @@ def fill_template_ppt(
         f"{{{{ITEM{i}}}}}" for i in negative_item_positions
     }
 
-    # NEW: remove legend completely when no negative items were chosen
     if not negative_item_positions:
         _remove_negative_legend(slide)
 
@@ -612,7 +622,9 @@ def fill_template_ppt(
     for shape in slide.shapes:
         _replace_placeholders_in_shape(shape, replacements)
 
-    prs.save(output_pptx)
+    final_output_pptx = str(next_available_path(output_pptx))
+    prs.save(final_output_pptx)
+    return final_output_pptx
 
 
 def shap_multiclass_report(
@@ -924,7 +936,7 @@ class NegativeItemsDialog(QDialog):
                 | Qt.ItemFlag.ItemIsSelectable
             )
             item.setCheckState(Qt.CheckState.Unchecked)
-            item.setData(Qt.ItemDataRole.UserRole, idx + 1)  # slide position 1..8
+            item.setData(Qt.ItemDataRole.UserRole, idx + 1)
             self.list_widget.addItem(item)
 
         self.buttons = QDialogButtonBox(
@@ -1030,8 +1042,12 @@ class AnalysisWorker(QObject):
 
                 out_dir.mkdir(parents=True, exist_ok=True)
 
-                output_excel = str(out_dir / f"top_features_target_{self.target_question}.xlsx")
-                plot_path = str(out_dir / f"shap_summary_target_{self.target_question}.png")
+                output_excel = str(next_available_path(
+                    out_dir / f"top_features_target_{self.target_question}.xlsx"
+                ))
+                plot_path = str(next_available_path(
+                    out_dir / f"shap_summary_target_{self.target_question}.png"
+                ))
 
                 global_top, explainer, shap_values_raw = shap_multiclass_report(
                     best_rf=best_rf,
@@ -1064,7 +1080,9 @@ class AnalysisWorker(QObject):
                         f"At least 8 are required for the presentation."
                     )
 
-                ppt_path = str(out_dir / f"impact_slide_target_{self.target_question}.pptx")
+                ppt_path = str(next_available_path(
+                    out_dir / f"impact_slide_target_{self.target_question}.pptx"
+                ))
 
                 self.progress.emit(100)
                 self.finished.emit({
@@ -1294,7 +1312,7 @@ class SurveyAnalyzerWindow(QMainWindow):
 
         negative_item_positions = negative_dialog.selected_positions()
 
-        fill_template_ppt(
+        created_ppt_path = fill_template_ppt(
             template_path=result["template_path"],
             output_pptx=result["ppt_path"],
             global_top=selected_df,
@@ -1316,7 +1334,7 @@ class SurveyAnalyzerWindow(QMainWindow):
         else:
             self._append_log("No negative items selected -> negative legend hidden.")
 
-        return result["ppt_path"]
+        return created_ppt_path
 
     def _on_finished(self, result: dict):
         excel_uri = Path(result["excel_path"]).resolve().as_uri()
